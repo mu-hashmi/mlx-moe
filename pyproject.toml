@@ -3,10 +3,10 @@ name = "mlx-moe"
 version = "0.1.0"
 description = "Run large MoE models on memory-constrained Macs via on-demand expert loading"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "mlx>=0.22.0",
-    "mlx-lm>=0.30.0",
+    "mlx>=0.31.1",
+    "mlx-lm>=0.31.1",
     "numpy>=2.0.0",
     "starlette>=0.46.0",
     "uvicorn>=0.34.0",

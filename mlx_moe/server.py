@@ -111,7 +111,25 @@ MODEL_SAMPLING_DEFAULTS = {
 }
 
 
-def _sampling_defaults(model_name: str) -> dict:
+def _sampling_defaults(model_name: str, model_path: Path | None = None) -> dict:
+    if model_path is not None:
+        config_path = model_path / "generation_config.json"
+        if config_path.is_file():
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                defaults = {}
+                if "temperature" in config:
+                    defaults["temp"] = config["temperature"]
+                if "top_p" in config:
+                    defaults["top_p"] = config["top_p"]
+                if "top_k" in config:
+                    defaults["top_k"] = config["top_k"]
+                if defaults:
+                    return defaults
+            except (json.JSONDecodeError, OSError):
+                pass
+
     slug = model_name.split("/")[-1].lower()
     for prefix, defaults in MODEL_SAMPLING_DEFAULTS.items():
         if prefix in slug:
@@ -119,8 +137,8 @@ def _sampling_defaults(model_name: str) -> dict:
     return {}
 
 
-def _sampling_kwargs(body: dict, model_name: str) -> dict:
-    defaults = _sampling_defaults(model_name)
+def _sampling_kwargs(body: dict, model_name: str, model_path: Path | None = None) -> dict:
+    defaults = _sampling_defaults(model_name, model_path)
     if "temperature" in body:
         defaults["temp"] = float(body["temperature"])
     if "top_p" in body:
@@ -185,27 +203,25 @@ class Server:
                  max_tokens: int = MAX_TOKENS_CAP,
                  max_input_tokens: int = MAX_INPUT_TOKENS,
                  kv_bits: int | None = None,
-                 warmup: str = "hybrid",
-                 kv_cache_slots: int = 1):
+                 warmup: str = "hybrid"):
         self._model_name = model_name
         self._capacity = capacity
         self._profile_path = profile_path or _find_profile(model_name)
         self._pin_top_k = pin_top_k
         self._model = None
         self._tokenizer = None
+        self._model_path = None
         self._lock = asyncio.Lock()
         self._model_id = model_name.split("/")[-1]
         self._max_tokens = max_tokens
         self._max_input_tokens = max_input_tokens
         self._kv_bits = kv_bits
         self._warmup = warmup
-        self._kv_cache_slots = max(1, kv_cache_slots)
-        self._kv_cache = OrderedDict()
 
     def load(self):
         from .lazy_experts.generate import _startup
         warmup_prompt = "Write a Python function that implements binary search on a sorted array."
-        model, tokenizer, _ = _startup(
+        model, tokenizer, model_path = _startup(
             self._model_name, warmup_prompt,
             cache_dir=str(Path.home() / ".cache" / "mlx-moe"),
             profile_path=self._profile_path,
@@ -215,6 +231,7 @@ class Server:
         )
         self._model = model
         self._tokenizer = tokenizer
+        self._model_path = model_path
         self._memory_gb = mx.get_active_memory() / 1e9
         if self._warmup == "hybrid":
             self._run_startup_refinement()
@@ -299,12 +316,6 @@ class Server:
             key = str(body["user"])
         return str(key) if key is not None else "default"
 
-    def _put_kv_cache(self, cache_key: str, tokens: list[int], kv_cache) -> None:
-        self._kv_cache[cache_key] = (tokens, kv_cache)
-        self._kv_cache.move_to_end(cache_key)
-        while len(self._kv_cache) > self._kv_cache_slots:
-            self._kv_cache.popitem(last=False)
-
     @staticmethod
     def _dynamic_update_policy(
         generation_tokens: int,
@@ -343,38 +354,11 @@ class Server:
                 cache_key: str, **sampling):
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
-        from mlx_lm.models import cache as cache_module
         from .lazy_experts.core import dynamic_cache_update
 
-        # Find longest common prefix with cached KV from previous request
+        # No KV cache - always generate from scratch
+        suffix = prompt_tokens
         prompt_cache = None
-        prefix_len = 0
-        cached = self._kv_cache.get(cache_key)
-        cached_tokens = None
-        cached_kv = None
-        if cached is not None:
-            cached_tokens, cached_kv = cached
-            self._kv_cache.move_to_end(cache_key)
-            min_len = min(len(cached_tokens), len(prompt_tokens))
-            while prefix_len < min_len and cached_tokens[prefix_len] == prompt_tokens[prefix_len]:
-                prefix_len += 1
-
-        if prefix_len > 0:
-            # generate_step requires at least 1 input token
-            if prefix_len >= len(prompt_tokens):
-                prefix_len = len(prompt_tokens) - 1
-            trim_amount = len(cached_tokens) - prefix_len
-            if trim_amount > 0:
-                cache_module.trim_prompt_cache(cached_kv, trim_amount)
-            prompt_cache = cached_kv
-            suffix = prompt_tokens[prefix_len:]
-            print(f"  [kv cache: reusing {prefix_len}, processing {len(suffix)} new tokens]")
-        else:
-            suffix = prompt_tokens
-            prompt_cache = cache_module.make_prompt_cache(self._model)
-
-        # Invalidate cache before generation — restored on successful completion
-        self._kv_cache.pop(cache_key, None)
 
         kv_kwargs = {}
         if self._kv_bits is not None:
@@ -397,8 +381,10 @@ class Server:
         complete = False
 
         try:
+            # When suffix is empty (exact cache match), don't pass prompt to avoid empty array error
+            prompt_arg = mx.array(suffix) if suffix else None
             for resp in _mlx_lm.stream_generate(
-                self._model, self._tokenizer, prompt=mx.array(suffix),
+                self._model, self._tokenizer, prompt=prompt_arg,
                 max_tokens=max_tokens, sampler=make_sampler(**sampling),
                 prompt_cache=prompt_cache, **kv_kwargs,
             ):
@@ -445,9 +431,6 @@ class Server:
 
             complete = True
         finally:
-            if complete:
-                self._put_kv_cache(cache_key, prompt_tokens + generated_tokens, prompt_cache)
-
             if first_token_at is not None:
                 prefill_ms = (prompt_len / prompt_tps * 1000.0) if prompt_tps > 0 else 0.0
                 ttft_ms = (first_token_at - request_t0) * 1000.0
@@ -505,7 +488,7 @@ class Server:
         max_tokens = min(raw if raw is not None else self._max_tokens, self._max_tokens)
         stream = body.get("stream", False)
         tools = body.get("tools")
-        sampling = _sampling_kwargs(body, self._model_name)
+        sampling = _sampling_kwargs(body, self._model_name, self._model_path)
         cache_key = self._cache_key_from_body(body)
 
         formatted = _format_messages(messages)
@@ -559,7 +542,7 @@ class Server:
             )
         max_tokens = min(body.get("max_tokens", self._max_tokens), self._max_tokens)
         stream = body.get("stream", False)
-        sampling = _sampling_kwargs(body, self._model_name)
+        sampling = _sampling_kwargs(body, self._model_name, self._model_path)
         cache_key = self._cache_key_from_body(body)
 
         tools_anthropic = body.get("tools")
@@ -939,19 +922,17 @@ class Server:
 def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                capacity: int | None = None, profile_path: str | None = None,
                pin_top_k: int | None = None,
-               max_tokens: int = MAX_TOKENS_CAP,
-               max_input_tokens: int = MAX_INPUT_TOKENS,
-               kv_bits: int | None = None,
-               warmup: str = "hybrid",
-               kv_cache_slots: int = 1,
-               shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT):
+                max_tokens: int = MAX_TOKENS_CAP,
+                max_input_tokens: int = MAX_INPUT_TOKENS,
+                kv_bits: int | None = None,
+                warmup: str = "hybrid",
+                shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT):
     import uvicorn
 
     server = Server(model_name, capacity=capacity, profile_path=profile_path,
                     pin_top_k=pin_top_k,
                     max_tokens=max_tokens, max_input_tokens=max_input_tokens,
-                    kv_bits=kv_bits, warmup=warmup,
-                    kv_cache_slots=kv_cache_slots)
+                    kv_bits=kv_bits, warmup=warmup)
 
     print(f"mlx-moe serve")
     print(f"  Model:    {model_name}")
@@ -959,15 +940,14 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
     if pin_top_k is not None:
         print(f"  Pin top-k: {pin_top_k}")
     print(f"  Endpoint: http://{host}:{port}")
-    defaults = _sampling_defaults(model_name)
     print(f"  Limits:   {max_input_tokens} input, {max_tokens} output")
-    print(f"  KV cache: {kv_cache_slots} slot(s)")
     print(f"  Shutdown: {shutdown_timeout}s graceful timeout")
-    if defaults:
-        print(f"  Sampling: {defaults}")
     print()
     print("Loading model...")
     server.load()
+    defaults = _sampling_defaults(model_name, server._model_path)
+    if defaults:
+        print(f"  Sampling: {defaults}")
     print(f"  Memory: {server._memory_gb:.1f} GB")
     print(f"  Ready.")
     print()

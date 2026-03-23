@@ -214,3 +214,86 @@ Limits:
 - No defensive checks for impossible states.
 - No silent fallbacks that hide failures.
 - Remove dead code paths cleanly; no compatibility shims for deleted behavior.
+
+### Python Style Guidelines
+
+**Imports** (ordered by PEP 8 with custom groupings):
+1. Standard library (`asyncio`, `json`, `pathlib`, `re`, `time`, `uuid`)
+2. Third-party packages (`mlx`, `mlx.nn`, `mlx_lm`, `numpy`, `pytest`, `starlette`, `uvicorn`)
+3. Local imports (`from mlx_moe.lazy_experts import ...`)
+
+Use absolute imports for the package (`from mlx_moe.lazy_experts.modules import ...`), not relative (`from .modules import ...`).
+
+**Formatting**:
+- Maximum line length: 100 characters
+- Use 4 spaces for indentation (no tabs)
+- Use hanging indents for long function signatures
+- Put imports in a single block (no multiple `import` statements scattered)
+
+**Types**:
+- Use Python 3.12+ type hints: `def foo(x: int) -> str:`
+- Use `X | None` instead of `Optional[X]`
+- Use `dict[str, int]` instead of `Dict[str, int]`
+- For internal/private functions, type hints are optional but encouraged
+- Use `Path` from `pathlib` for file paths
+
+**Naming Conventions**:
+- `snake_case` for functions, methods, and variables
+- `SCREAMING_SNAKE_CASE` for constants
+- `PascalCase` for classes
+- Leading underscore (`_func`) for private functions
+- Double leading underscore (`__method`) for name mangling (use sparingly)
+- Suffix `_cb` for callback functions
+- Suffix `_map` for dict-based mappings
+- Prefix `num_` or `n_` for counts
+
+**Error Handling**:
+- Raise specific exceptions with clear messages
+- Do not catch bare `Exception` unless re-raising or logging
+- Use `assert` for internal invariants, not for runtime validation
+- Fail fast with descriptive errors, not silent fallbacks
+
+**MLX-Specific**:
+- Never call `mx.eval()` in the forward pass of predictive modules (critical for performance)
+- Use `mx.stop_gradient()` where needed to prevent unwanted gradient flow
+- Prefer in-place operations when possible to reduce memory allocation
+- Remember MLX GPU eval is not thread-safe; serialization in server is intentional
+
+## Testing
+
+**Run all tests**:
+```bash
+uv run pytest
+```
+
+**Run a single test file**:
+```bash
+uv run pytest tests/test_unit_core.py
+```
+
+**Run a single test class**:
+```bash
+uv run pytest tests/test_unit_core.py::TestExpertCache
+```
+
+**Run a single test function**:
+```bash
+uv run pytest tests/test_unit_core.py::TestExpertCache::test_put_and_lookup -v
+```
+
+**Run tests matching a pattern**:
+```bash
+uv run pytest -k "test_lcp"
+```
+
+**Run with output capture disabled** (see print statements):
+```bash
+uv run pytest -s
+```
+
+**Run integration tests only**:
+```bash
+uv run pytest tests/test_integration.py
+```
+
+Note: Some tests in `test_unit_core.py` use synthetic mocks and don't require model files. Integration tests may require a real model to be available.

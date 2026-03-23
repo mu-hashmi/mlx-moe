@@ -227,25 +227,45 @@ session.close()                          # release model
 
 For full control over the loading pipeline:
 
-```python
+```bash
+uv run python -c "
 import mlx.core as mx
 import mlx_lm
-from mlx_lm.utils import hf_repo_to_path
-from mlx_moe.lazy_experts import (
-    enable_lazy_experts, upgrade_to_predictive, get_fallback_stats
-)
-
-model, tokenizer = mlx_lm.load("mlx-community/Qwen3-Coder-Next-4bit", lazy=True)
-model_path = hf_repo_to_path("mlx-community/Qwen3-Coder-Next-4bit")
-
+from mlx_moe.lazy_experts import enable_lazy_experts, upgrade_to_predictive, get_fallback_stats
+from mlx_moe.lazy_experts.loading import _find_switch_mlp
+from mlx_moe.lazy_experts.discovery import router_only_discovery
+from mlx_moe.lazy_experts.core import dynamic_cache_update, enable_skip_fallback
+model_path = '/Users/steven/.lmstudio/models/lmstudio-community/Qwen3-Coder-Next-MLX-4bit'
+print('Loading model...')
+model, tokenizer = mlx_lm.load(model_path, lazy=True)
+print('Model loaded')
+print('Enable cached capacity=208...')
 enable_lazy_experts(model, model_path, cache_capacity_per_layer=208, predictive=True)
 mx.eval(model.parameters())
-
-mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=10, verbose=False)
+switch, _ = _find_switch_mlp(model.layers[0], 0)
+print('Module type:', type(switch.gate_proj).__name__)
+print('=== Router-only discovery (does NOT load experts) ===')
+router_only_discovery(model, tokenizer, 'git pull origin main', max_tokens=10)
+print('Discovery done')
+print('Upgrade to predictive...')
 upgrade_to_predictive(model, model_path, 208)
-
-output = mlx_lm.generate(model, tokenizer, prompt="Write a Flask server",
-                          max_tokens=200, verbose=False)
+switch, _ = _find_switch_mlp(model.layers[0], 0)
+print('After upgrade:', type(switch.gate_proj).__name__)
+print('Enable skip fallback...')
+enable_skip_fallback(model)
+print('=== Hybrid warmup (10 tokens) ===')
+for resp in mlx_lm.stream_generate(model, tokenizer, prompt='git pull origin main', max_tokens=10):
+    pass
+dynamic_cache_update(model, max_layer_updates=48)
+print('Hybrid done')
+print()
+print('=== First generate ===')
+output = mlx_lm.generate(model, tokenizer, prompt='git pull origin main', max_tokens=50, verbose=False)
+print('Output:', repr(output[:150]))
+stats = get_fallback_stats(model)
+rate = stats['fallback_rate'] * 100
+print('Fallback rate:', rate, '%')
+"
 ```
 
 ## Testing

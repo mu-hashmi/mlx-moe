@@ -31,6 +31,29 @@ from .persistence import (
 _WARMUP_CACHE = 256 * 1024 * 1024
 
 
+def _fix_group_size(model):
+    """Fix group_size mismatch by inferring from weight/scales shapes.
+
+    Some models (e.g., Qwen3-Coder-Next-MLX-8bit) have incorrect group_size
+    in config.json. The actual group_size must be computed from tensor shapes.
+    """
+    for layer in model.layers:
+        switch, _ = _find_switch_mlp(layer)
+        if switch is None:
+            continue
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            proj = getattr(switch, name, None)
+            if proj is None or not hasattr(proj, "weight") or not hasattr(proj, "scales"):
+                continue
+            # Infer actual group_size from shapes
+            # weight shape: (num_experts, output_dim, input_dim)
+            # scales shape: (num_experts, output_dim, num_groups)
+            # group_size = input_dim / num_groups
+            actual = proj.weight.shape[-1] // proj.scales.shape[-1]
+            if actual != proj.group_size:
+                proj.group_size = actual
+
+
 def _startup(
     model_name,
     prompt,
@@ -54,12 +77,66 @@ def _startup(
     from .core import upgrade_to_predictive
     import mlx_lm as _mlx_lm
     from mlx_lm.utils import hf_repo_to_path
+    from huggingface_hub.errors import HFValidationError
 
     t_total_start = time.perf_counter()
 
-    model_path = hf_repo_to_path(model_name)
+    # First check if the path exists at all
+    if os.path.exists(model_name):
+        if not os.path.isdir(model_name):
+            raise FileNotFoundError(
+                f"Model path exists but is not a directory: {model_name}"
+            )
+        model_path = Path(model_name)
+    elif "/" not in model_name:
+        # Local path without slash - try as relative path
+        raise FileNotFoundError(
+            f"Model path does not exist: {model_name}\n"
+            f"Use a valid local path or HuggingFace model ID (e.g., mlx-community/Qwen3-Coder-Next-4bit)"
+        )
+    else:
+        # HuggingFace model ID - verify it looks like one (has namespace/repo format)
+        # and doesn't look like a file path
+        if model_name.startswith("/") or model_name.startswith("."):
+            raise FileNotFoundError(
+                f"Model path does not exist: {model_name}\n"
+                f"Use a valid local path or HuggingFace model ID (e.g., mlx-community/Qwen3-Coder-Next-4bit)"
+            )
+        try:
+            model_path = hf_repo_to_path(model_name)
+        except HFValidationError:
+            raise FileNotFoundError(
+                f"Invalid model ID or model not found: {model_name}\n"
+                f"HuggingFace model IDs should be in the format 'namespace/repo_name'"
+            )
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Failed to download model: {model_name}\n{str(e)}"
+            )
+
+    if not model_path.is_dir():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        safetensors_files = list(model_path.glob("*.safetensors"))
+        if not safetensors_files:
+            raise FileNotFoundError(
+                f"Model directory is empty or missing model files: {model_path}\n"
+                f"Please download the model first."
+            )
+        else:
+            raise FileNotFoundError(
+                f"config.json not found in: {model_path}\n"
+                f"This may not be a valid HuggingFace-compatible model directory."
+            )
+
     t0 = time.perf_counter()
-    model, tokenizer = _mlx_lm.load(model_name, lazy=True)
+    model, tokenizer = _mlx_lm.load(str(model_path), lazy=True)
+
+    # Fix group_size mismatch: config.json may declare wrong group_size
+    # Actual group_size must be inferred from weight/scales shapes
+    # _fix_group_size(model)
 
     # Detect MoE architecture
     num_moe_layers = 0
@@ -120,9 +197,17 @@ def _startup(
     if cache_dir is not None:
         cache_dir = os.path.expanduser(cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
-        safe_name = model_name.replace("/", "--")
-        cache_path = os.path.join(cache_dir, f"{safe_name}.json")
+        model_path_str = str(model_path).rstrip("/")
+        safe_name_base = model_path_str.replace("/", "--").replace("\\", "--")
+
+        cache_path = os.path.join(cache_dir, f"{safe_name_base}.json")
         prepacked_path = cache_path.replace(".json", ".weights.safetensors")
+        meta_path = prepacked_path + ".meta.json"
+
+        if not os.path.exists(meta_path):
+            safe_name_alt = safe_name_base + "--"
+            cache_path = os.path.join(cache_dir, f"{safe_name_alt}.json")
+            prepacked_path = cache_path.replace(".json", ".weights.safetensors")
 
     used_saved_state = False
     mx.reset_peak_memory()

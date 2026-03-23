@@ -21,8 +21,6 @@ def main():
                        help="Max input tokens — rejects requests over this (default: 16384)")
     serve.add_argument("--kv-bits", type=int, default=None,
                        help="Quantize KV cache to N bits (8 recommended). Saves ~45%% KV memory.")
-    serve.add_argument("--kv-cache-slots", type=int, default=1,
-                       help="Number of keyed KV cache entries to keep (default: 1).")
     serve.add_argument("--shutdown-timeout", type=int, default=5,
                        help="Graceful shutdown timeout in seconds before cancelling active requests (default: 5).")
     serve.add_argument("--warmup", choices=["hybrid", "full", "none"], default="hybrid",
@@ -44,7 +42,6 @@ def main():
             max_input_tokens=args.max_input_tokens,
             kv_bits=args.kv_bits,
             warmup=args.warmup,
-            kv_cache_slots=args.kv_cache_slots,
             shutdown_timeout=args.shutdown_timeout,
         )
     else:
