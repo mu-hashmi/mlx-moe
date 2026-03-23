@@ -243,7 +243,14 @@ class PredictiveExpertCache:
                  '_shard_paths', '_key_prefixes', '_shard_map',
                  '_st_map',
                  'total_requests', 'total_fallbacks',
-                 'pinned_set')
+                 'pinned_set',
+                 # Double buffering: Buffer A and Buffer B
+                 'weights_A', 'scales_A', 'biases_A', 'cached_ids_A',
+                 'weights_B', 'scales_B', 'biases_B', 'cached_ids_B',
+                 '_active_buffer',
+                 # Prefetch state
+                 '_prefetch_buffer', '_pending_prefetch',
+                 '_prefetch_in_progress')
 
     def __init__(self, capacity: int, num_experts: int = 512):
         self.capacity = capacity
@@ -266,6 +273,20 @@ class PredictiveExpertCache:
         self.total_requests: int = 0
         self.total_fallbacks: int = 0
         self.pinned_set: set[int] = set()
+        # Double buffering: Buffer A and Buffer B
+        self.weights_A: dict[str, mx.array] = {}
+        self.scales_A: dict[str, mx.array] = {}
+        self.biases_A: dict[str, mx.array | None] = {}
+        self.cached_ids_A: list[int] = []  # Expert IDs in Buffer A
+        self.weights_B: dict[str, mx.array] = {}
+        self.scales_B: dict[str, mx.array] = {}
+        self.biases_B: dict[str, mx.array | None] = {}
+        self.cached_ids_B: list[int] = []  # Expert IDs in Buffer B
+        self._active_buffer = 'A'
+        # Prefetch state
+        self._prefetch_buffer = 'B'  # Target buffer for prefetch
+        self._pending_prefetch: list[int] = []
+        self._prefetch_in_progress = False
 
     def build_lookup(self, cached_ids: list[int]) -> None:
         """Build GPU-resident lookup table and hit mask from cached expert IDs.
@@ -293,6 +314,137 @@ class PredictiveExpertCache:
     def remap(self, indices: mx.array) -> mx.array:
         """Map global expert IDs to cache slots. Pure mx.array op, no eval."""
         return self.lookup[indices]
+
+    def get_weights(self, proj_name: str) -> mx.array:
+        """Get weights from current active buffer."""
+        if self._active_buffer == 'A':
+            return self.weights_A.get(proj_name) or self.weights.get(proj_name)
+        return self.weights_B.get(proj_name) or self.weights.get(proj_name)
+
+    def get_scales(self, proj_name: str) -> mx.array:
+        """Get scales from current active buffer."""
+        if self._active_buffer == 'A':
+            return self.scales_A.get(proj_name) or self.scales.get(proj_name)
+        return self.scales_B.get(proj_name) or self.scales.get(proj_name)
+
+    def get_biases(self, proj_name: str) -> mx.array | None:
+        """Get biases from current active buffer."""
+        if self._active_buffer == 'A':
+            return self.biases_A.get(proj_name) if proj_name in self.biases_A else self.biases.get(proj_name)
+        return self.biases_B.get(proj_name) if proj_name in self.biases_B else self.biases.get(proj_name)
+
+    def swap_buffers(self) -> None:
+        """Swap active buffer (A <-> B)."""
+        self._active_buffer = 'B' if self._active_buffer == 'A' else 'A'
+
+    def predict_next_experts(self) -> list[int]:
+        """Predict next layer experts using current layer requests."""
+        if not self._indices_buffer:
+            return []
+        recent = self._indices_buffer[-1]
+        flat = np.asarray(recent.reshape(-1))
+        return [int(x) for x in np.unique(flat)]
+
+    def prefetch_async(self, expert_ids: list[int]) -> None:
+        """Initiate prefetch of experts to prefetch buffer.
+        
+        This loads experts into the inactive buffer (Buffer B if active is A).
+        The data is loaded synchronously but happens during the token gap,
+        potentially overlapping with GPU computation.
+        """
+        if self._prefetch_in_progress:
+            return  # Already prefetching
+        
+        # Filter to experts not in current active buffer
+        current_buffer_set = set()
+        if self._active_buffer == 'A':
+            for proj in ('gate_proj', 'up_proj', 'down_proj'):
+                if proj in self.weights_A:
+                    current_buffer_set.update(self.cached_ids[:len(self.weights_A)])
+        else:
+            for proj in ('gate_proj', 'up_proj', 'down_proj'):
+                if proj in self.weights_B:
+                    current_buffer_set.update(self.cached_ids[:len(self.weights_B)])
+        
+        missing = [eid for eid in expert_ids if eid not in self.cached_set]
+        if not missing or not self._shard_paths:
+            return
+        
+        # Limit prefetch count
+        MAX_PREFETCH = 8
+        prefetch_ids = missing[:MAX_PREFETCH]
+        
+        # Determine target buffer
+        target_weights = self.weights_A if self._prefetch_buffer == 'A' else self.weights_B
+        target_scales = self.scales_A if self._prefetch_buffer == 'A' else self.scales_B
+        target_biases = self.biases_A if self._prefetch_buffer == 'A' else self.biases_B
+        
+        # If target buffer is empty, we need to allocate slots
+        if not target_weights:
+            # Use slot indices 0 to len(prefetch_ids)-1 for prefetch
+            slot_indices = list(range(len(prefetch_ids)))
+            new_eids = mx.array(prefetch_ids)
+            
+            for proj_name in ('gate_proj', 'up_proj', 'down_proj'):
+                if proj_name not in self._shard_paths:
+                    continue
+                    
+                shard_path = self._shard_paths[proj_name]
+                key_prefix = self._key_prefixes[proj_name]
+                shard = mx.load(shard_path) if self._st_map is None else None
+                new_w, new_s, new_b = _load_experts(
+                    key_prefix, new_eids,
+                    shard=shard, shard_map=self._shard_map,
+                    st_map=self._st_map
+                )
+                del shard
+                
+                if new_b is None:
+                    mx.eval(new_w, new_s)
+                else:
+                    mx.eval(new_w, new_s, new_b)
+                
+                target_weights[proj_name] = new_w
+                target_scales[proj_name] = new_s
+                if new_b is not None:
+                    target_biases[proj_name] = new_b
+            
+            # Update cached_ids for prefetch buffer
+            if self._prefetch_buffer == 'A':
+                self.weights_A = target_weights
+                self.scales_A = target_scales
+                self.biases_A = target_biases
+                # Update cached_ids_A tracking
+                self.cached_ids_A = list(prefetch_ids)
+            else:
+                self.weights_B = target_weights
+                self.scales_B = target_scales
+                self.biases_B = target_biases
+                self.cached_ids_B = list(prefetch_ids)
+            
+            self._prefetch_in_progress = True
+            self._pending_prefetch = prefetch_ids
+
+    def check_prefetch_and_swap(self) -> bool:
+        """Check if prefetch completed and swap buffers if ready.
+        
+        Returns True if buffers were swapped.
+        """
+        if not self._prefetch_in_progress or not self._pending_prefetch:
+            return False
+        
+        # Check if pending experts are loaded in prefetch buffer
+        prefetch_target = self._prefetch_buffer
+        weights = self.weights_A if prefetch_target == 'A' else self.weights_B
+        
+        # Simple check: if prefetch buffer has any data, consider it ready
+        if weights:
+            self.swap_buffers()
+            self._prefetch_in_progress = False
+            self._pending_prefetch = []
+            return True
+        
+        return False
 
     def _lcp_priority(self, eid: int) -> float:
         mu = self.frequency.get(eid, 0)
@@ -428,11 +580,12 @@ class PredictiveCachedSwitchLinear(nn.Module):
             self._cache._indices_buffer.append(indices)
         local_indices = self._cache.remap(indices)
         # Remap breaks sorted order — always pass sorted_indices=False
+        # Use double buffer methods
+        w = self._cache.get_weights(self._proj_name)
+        s = self._cache.get_scales(self._proj_name)
+        b = self._cache.get_biases(self._proj_name)
         return mx.gather_qmm(
-            x,
-            self._cache.weights[self._proj_name],
-            self._cache.scales[self._proj_name],
-            self._cache.biases[self._proj_name],
+            x, w, s, b,
             rhs_indices=local_indices,
             transpose=True,
             group_size=self.group_size,
@@ -465,11 +618,12 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
         mx.eval(indices)
         local_indices = self._cache.remap(indices)
         # Remap breaks sorted order — always pass sorted_indices=False
+        # Use double buffer methods
+        w = self._cache.get_weights(self._proj_name)
+        s = self._cache.get_scales(self._proj_name)
+        b = self._cache.get_biases(self._proj_name)
         return mx.gather_qmm(
-            x,
-            self._cache.weights[self._proj_name],
-            self._cache.scales[self._proj_name],
-            self._cache.biases[self._proj_name],
+            x, w, s, b,
             rhs_indices=local_indices,
             transpose=True,
             group_size=self.group_size,

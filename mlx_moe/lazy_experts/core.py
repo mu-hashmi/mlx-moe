@@ -637,6 +637,30 @@ def dynamic_cache_update(model, max_layer_updates: int = 12) -> list[dict]:
 
         layer_stats["layer"] = i
         stats.append(layer_stats)
+
+    # Prefetch: trigger next layer prefetch based on current layer requests
+    # This runs after current layer updates to predict next layer needs
+    for i in range(len(model.layers) - 1):
+        curr_proj = getattr(model.layers[i].mlp.switch_mlp, "up_proj", None)
+        if not curr_proj or not isinstance(curr_proj, PredictiveCachedSwitchLinear):
+            continue
+        
+        next_layer = model.layers[i + 1]
+        next_switch, _ = _find_switch_mlp(next_layer, i + 1)
+        if next_switch is None:
+            continue
+        
+        next_proj = getattr(next_switch, "up_proj", None)
+        if not next_proj or not isinstance(next_proj, PredictiveCachedSwitchLinear):
+            continue
+        
+        # Use current layer requests to predict next layer
+        predicted_experts = curr_proj._cache.predict_next_experts()
+        if predicted_experts:
+            next_proj._cache.prefetch_async(predicted_experts)
+            # Check if we can swap buffers for next layer
+            next_proj._cache.check_prefetch_and_swap()
+    
     return stats
 
 

@@ -50,7 +50,7 @@ flowchart TD
     G --> F
     F --> H["stream generation"]
     H --> I{"completed successfully?"}
-    I -- yes --> J["store (prompt_tokens + generated, prompt_cache) in keyed LRU"]
+    I -- yes --> J["store (prompt_tokens, prompt_cache) in keyed LRU"]
     I -- no --> K["do not restore cache entry"]
 ```
 
